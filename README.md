@@ -1,6 +1,7 @@
 **upscale_png.py usage**
 
 **Setup**
+
 pip install Pillow
 
 **Commands**

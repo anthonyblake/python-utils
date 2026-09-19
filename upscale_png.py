@@ -1,145 +1,295 @@
-"""
-PNG Upscaler Script for Windows 10
-====================================
-Upscales PNG images using high-quality Lanczos resampling (via Pillow).
+"""PNG upscaler using Pillow with strict validation and robust error handling."""
 
-Requirements:
-    pip install Pillow
-
-Usage:
-    python upscale_png.py <input.png> [options]
-
-Examples:
-    python upscale_png.py photo.png                        # 2x upscale (default)
-    python upscale_png.py photo.png --scale 4              # 4x upscale
-    python upscale_png.py photo.png --width 1920           # Resize to specific width
-    python upscale_png.py photo.png --width 1920 --height 1080  # Resize to exact dimensions
-    python upscale_png.py photo.png --output upscaled.png  # Custom output filename
-"""
+from __future__ import annotations
 
 import argparse
-import sys
+import logging
+import math
 from pathlib import Path
+from typing import Optional
 
-try:
-    from PIL import Image
-except ImportError:
-    print("ERROR: Pillow is not installed.")
-    print("Run: pip install Pillow")
-    sys.exit(1)
+from PIL import Image, UnidentifiedImageError
+from PIL.Image import Resampling
+
+LOGGER = logging.getLogger(__name__)
+
+FILTER_MAP: dict[str, Resampling] = {
+    "lanczos": Resampling.LANCZOS,
+    "bicubic": Resampling.BICUBIC,
+    "bilinear": Resampling.BILINEAR,
+    "nearest": Resampling.NEAREST,
+}
+
+
+class UpscaleError(Exception):
+    """Base exception for image upscaling failures."""
+
+
+class ValidationError(UpscaleError):
+    """Raised when input arguments, dimensions, or paths are invalid."""
+
+
+def _is_within_directory(base_dir: Path, target_path: Path) -> bool:
+    try:
+        target_path.relative_to(base_dir)
+        return True
+    except ValueError:
+        return False
+
+
+def _resolve_output_path(input_path: Path, output_path: Optional[str | Path]) -> Path:
+    """Resolve output path and block directory traversal outside input directory."""
+    base_dir = input_path.parent.resolve()
+    if output_path is None:
+        return base_dir / f"{input_path.stem}_upscaled.png"
+
+    requested = Path(output_path)
+    if any(part == ".." for part in requested.parts):
+        raise ValidationError("Output path must not contain '..' traversal segments.")
+
+    if requested.is_absolute():
+        resolved = requested.resolve()
+    else:
+        resolved = (base_dir / requested).resolve()
+
+    if not _is_within_directory(base_dir, resolved):
+        raise ValidationError("Output path must remain within the input file directory.")
+
+    if resolved.suffix.lower() != ".png":
+        raise ValidationError("Output filename must have a .png extension.")
+
+    return resolved
+
+
+def _safe_size_kib(path: Path) -> Optional[float]:
+    try:
+        return path.stat().st_size / 1024
+    except OSError as exc:
+        LOGGER.warning("Unable to read file size for %s: %s", path, exc)
+        return None
+
+
+def _load_png(input_path: Path) -> Image.Image:
+    """Load an image, verify PNG format, and fully decode to catch corruption."""
+    try:
+        with Image.open(input_path) as image:
+            image.load()
+            if image.format != "PNG":
+                raise ValidationError(f"Input file is not a PNG image: {input_path}")
+            if image.width <= 0 or image.height <= 0:
+                raise ValidationError(
+                    f"Input image has invalid dimensions: {image.width}x{image.height}"
+                )
+            return image.copy()
+    except FileNotFoundError as exc:
+        raise ValidationError(f"Input file not found: {input_path}") from exc
+    except PermissionError as exc:
+        raise UpscaleError(f"Permission denied reading input file: {input_path}") from exc
+    except UnidentifiedImageError as exc:
+        raise ValidationError(f"Input file is not a valid image: {input_path}") from exc
+    except ValidationError:
+        raise
+    except (OSError, ValueError) as exc:
+        raise UpscaleError(f"Failed to decode input file '{input_path}': {exc}") from exc
+
+
+def _calculate_target_dimensions(
+    orig_width: int,
+    orig_height: int,
+    scale: float,
+    target_width: Optional[int],
+    target_height: Optional[int],
+) -> tuple[int, int]:
+    if orig_width <= 0 or orig_height <= 0:
+        raise ValidationError(f"Source dimensions must be positive, got {orig_width}x{orig_height}")
+
+    if target_width is not None and target_width <= 0:
+        raise ValidationError(f"--width must be > 0, got {target_width}")
+    if target_height is not None and target_height <= 0:
+        raise ValidationError(f"--height must be > 0, got {target_height}")
+
+    if target_width is not None and target_height is not None:
+        new_width = target_width
+        new_height = target_height
+    elif target_width is not None:
+        ratio = target_width / orig_width
+        new_width = target_width
+        new_height = max(1, int(round(orig_height * ratio)))
+    elif target_height is not None:
+        ratio = target_height / orig_height
+        new_width = max(1, int(round(orig_width * ratio)))
+        new_height = target_height
+    else:
+        if not math.isfinite(scale) or scale <= 0:
+            raise ValidationError(f"--scale must be a finite number > 0, got {scale}")
+        new_width = max(1, int(round(orig_width * scale)))
+        new_height = max(1, int(round(orig_height * scale)))
+
+    if new_width <= 0 or new_height <= 0:
+        raise ValidationError(f"Computed invalid target dimensions: {new_width}x{new_height}")
+    return new_width, new_height
 
 
 def upscale_image(
-    input_path: str,
-    output_path: str = None,
+    input_path: str | Path,
+    output_path: Optional[str | Path] = None,
     scale: float = 2.0,
-    target_width: int = None,
-    target_height: int = None,
-    resample=Image.LANCZOS,
-):
-    input_path = Path(input_path)
+    target_width: Optional[int] = None,
+    target_height: Optional[int] = None,
+    resample: Optional[Resampling] = None,
+    optimize: bool = True,
+    compress_level: int = 6,
+) -> Path:
+    """Upscale a PNG image and return output path."""
+    source_path = Path(input_path).expanduser()
+    if compress_level < 0 or compress_level > 9:
+        raise ValidationError(f"--compress-level must be between 0 and 9, got {compress_level}")
 
-    if not input_path.exists():
-        print(f"ERROR: File not found: {input_path}")
-        sys.exit(1)
+    destination_path = _resolve_output_path(source_path, output_path)
+    try:
+        if destination_path.resolve() == source_path.resolve():
+            raise ValidationError("Output path must be different from input path.")
+    except OSError as exc:
+        raise UpscaleError(f"Unable to resolve input/output paths: {exc}") from exc
 
-    if input_path.suffix.lower() != ".png":
-        print(f"WARNING: File does not have a .png extension: {input_path}")
+    selected_resample = resample if resample is not None else Resampling.LANCZOS
+    image = _load_png(source_path)
+    try:
+        orig_width, orig_height = image.size
+        new_width, new_height = _calculate_target_dimensions(
+            orig_width=orig_width,
+            orig_height=orig_height,
+            scale=scale,
+            target_width=target_width,
+            target_height=target_height,
+        )
 
-    # Build output path
-    if output_path is None:
-        output_path = input_path.parent / f"{input_path.stem}_upscaled.png"
-    else:
-        output_path = Path(output_path)
+        LOGGER.info("Opening: %s", source_path)
+        LOGGER.info("Original size: %d x %d px | Mode: %s", orig_width, orig_height, image.mode)
+        LOGGER.info(
+            "Target size: %d x %d px (scale factor: %.2fx)",
+            new_width,
+            new_height,
+            new_width / orig_width,
+        )
+        if new_width <= orig_width and new_height <= orig_height:
+            LOGGER.warning("Target dimensions are not larger than source dimensions.")
 
-    print(f"Opening: {input_path}")
-    img = Image.open(input_path)
-    orig_width, orig_height = img.size
-    print(f"Original size: {orig_width} x {orig_height} px  |  Mode: {img.mode}")
+        upscaled = image.resize((new_width, new_height), selected_resample)
+        try:
+            destination_path.parent.mkdir(parents=True, exist_ok=True)
+            upscaled.save(
+                destination_path,
+                format="PNG",
+                optimize=optimize,
+                compress_level=compress_level,
+            )
+        except (OSError, ValueError) as exc:
+            raise UpscaleError(f"Failed to save output file '{destination_path}': {exc}") from exc
+        finally:
+            upscaled.close()
+    finally:
+        image.close()
 
-    # Determine target dimensions
-    if target_width and target_height:
-        new_width = target_width
-        new_height = target_height
-    elif target_width:
-        ratio = target_width / orig_width
-        new_width = target_width
-        new_height = int(orig_height * ratio)
-    elif target_height:
-        ratio = target_height / orig_height
-        new_width = int(orig_width * ratio)
-        new_height = target_height
-    else:
-        new_width = int(orig_width * scale)
-        new_height = int(orig_height * scale)
+    LOGGER.info("Saved to: %s", destination_path)
+    in_size = _safe_size_kib(source_path)
+    out_size = _safe_size_kib(destination_path)
+    if in_size is not None and out_size is not None:
+        LOGGER.info("File size: %.1f KiB -> %.1f KiB", in_size, out_size)
 
-    print(f"Target size:   {new_width} x {new_height} px  (scale factor: {new_width/orig_width:.2f}x)")
-
-    if new_width <= orig_width and new_height <= orig_height:
-        print("WARNING: Target is smaller than or equal to the original. Continuing anyway...")
-
-    # Perform upscale
-    print("Upscaling... ", end="", flush=True)
-    upscaled = img.resize((new_width, new_height), resample)
-    print("Done.")
-
-    # Save
-    upscaled.save(output_path, format="PNG", optimize=False)
-    print(f"Saved to: {output_path}")
-
-    # File size info
-    in_size = input_path.stat().st_size / 1024
-    out_size = output_path.stat().st_size / 1024
-    print(f"File size: {in_size:.1f} KB  →  {out_size:.1f} KB")
+    return destination_path
 
 
-def main():
+def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Upscale a PNG image using high-quality Lanczos resampling.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__,
+        epilog=(
+            "Examples:\n"
+            "  python upscale_png.py photo.png\n"
+            "  python upscale_png.py photo.png --scale 4\n"
+            "  python upscale_png.py photo.png --width 1920\n"
+            "  python upscale_png.py photo.png --width 1920 --height 1080\n"
+            "  python upscale_png.py photo.png --no-optimize --compress-level 9\n"
+            "  python upscale_png.py photo.png --output output/upscaled.png"
+        ),
     )
     parser.add_argument("input", help="Path to the input PNG file")
     parser.add_argument(
-        "--scale", type=float, default=2.0,
-        help="Scale multiplier (default: 2.0 = double the resolution)"
+        "--scale",
+        type=float,
+        default=2.0,
+        help="Scale multiplier (> 0, default: 2.0)",
     )
     parser.add_argument(
-        "--width", type=int, default=None,
-        help="Target width in pixels (preserves aspect ratio unless --height also set)"
+        "--width",
+        type=int,
+        default=None,
+        help="Target width in pixels (> 0). Preserves aspect ratio unless --height is set.",
     )
     parser.add_argument(
-        "--height", type=int, default=None,
-        help="Target height in pixels (preserves aspect ratio unless --width also set)"
+        "--height",
+        type=int,
+        default=None,
+        help="Target height in pixels (> 0). Preserves aspect ratio unless --width is set.",
     )
     parser.add_argument(
-        "--output", "-o", type=str, default=None,
-        help="Output file path (default: <input>_upscaled.png)"
+        "--output",
+        "-o",
+        type=str,
+        default=None,
+        help="Output path relative to input directory (default: <input>_upscaled.png).",
     )
     parser.add_argument(
-        "--filter", type=str, default="lanczos",
-        choices=["lanczos", "bicubic", "bilinear", "nearest"],
-        help="Resampling filter (default: lanczos — best quality)"
+        "--filter",
+        type=str,
+        default="lanczos",
+        choices=sorted(FILTER_MAP.keys()),
+        help="Resampling filter (default: lanczos)",
     )
+    parser.add_argument(
+        "--no-optimize",
+        dest="optimize",
+        action="store_false",
+        help="Disable PNG optimization during save.",
+    )
+    parser.set_defaults(optimize=True)
+    parser.add_argument(
+        "--compress-level",
+        type=int,
+        default=6,
+        help="PNG compression level from 0 (fastest) to 9 (smallest). Default: 6.",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Enable debug-level logging.",
+    )
+    return parser.parse_args(argv)
 
-    args = parser.parse_args()
 
-    filter_map = {
-        "lanczos": Image.LANCZOS,
-        "bicubic": Image.BICUBIC,
-        "bilinear": Image.BILINEAR,
-        "nearest": Image.NEAREST,
-    }
-
-    upscale_image(
-        input_path=args.input,
-        output_path=args.output,
-        scale=args.scale,
-        target_width=args.width,
-        target_height=args.height,
-        resample=filter_map[args.filter],
+def main(argv: Optional[list[str]] = None) -> int:
+    args = parse_args(argv)
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(levelname)s: %(message)s",
     )
+    try:
+        upscale_image(
+            input_path=args.input,
+            output_path=args.output,
+            scale=args.scale,
+            target_width=args.width,
+            target_height=args.height,
+            resample=FILTER_MAP[args.filter],
+            optimize=args.optimize,
+            compress_level=args.compress_level,
+        )
+    except UpscaleError as exc:
+        LOGGER.error("%s", exc)
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
